@@ -104,13 +104,23 @@ class Linear(nn.Module):
         enable_tuning: bool = True,
         fast_decoding: Optional[bool] = None,
         propagate_b: bool = False,
+        # Add these parameters:
+        operator_cache = None,
+        database_path = None,
     ):
         """
         @opt_M: optimize range of the input shape for dynamic symbolic
         if the input shape is a range, we will optimize the matmul with dynamic symbolic.
         if the input shape is int, we will optimize the matmul with static symbolic.
+        
+        @operator_cache: A specific cache instance to use for this linear layer
+        @database_path: A specific database path to use for this linear layer
         """
         super().__init__()
+
+        # Store the model-specific cache and database path
+        self.operator_cache = operator_cache if operator_cache is not None else global_operator_cache
+        self.database_path = database_path if database_path is not None else BITBLAS_DATABASE_PATH
 
         self.in_features = in_features
         self.out_features = out_features
@@ -242,23 +252,27 @@ class Linear(nn.Module):
     def _get_or_create_bitblas_operator(self, config, enable_tuning):
         BITBLAS_TARGET = auto_detect_nvidia_target()
 
-        if global_operator_cache.size() == 0:
-            global_operator_cache.load_from_database(BITBLAS_DATABASE_PATH, BITBLAS_TARGET)
-            logger.info(f"Loaded {global_operator_cache.size()} operators from database.")
+        # Use self.operator_cache instead of global_operator_cache
+        if self.operator_cache.size() == 0:
+            self.operator_cache.load_from_database(self.database_path, BITBLAS_TARGET)
+            logger.info(f"Loaded {self.operator_cache.size()} operators from database.")
 
-        bitblas_matmul = global_operator_cache.get(config)
+        # Use self.operator_cache instead of global_operator_cache
+        bitblas_matmul = self.operator_cache.get(config)
         if bitblas_matmul is None:
             # should disable tuning for the first time because we may require loading bitblas operator from database.
             bitblas_matmul = Matmul(config, target=BITBLAS_TARGET, enable_tuning=False)
             if enable_tuning:
                 bitblas_matmul.hardware_aware_finetune(topk=20)
-                global_operator_cache.add(config, bitblas_matmul)
-                global_operator_cache.save_into_database(BITBLAS_DATABASE_PATH, BITBLAS_TARGET)
-                print("BitBLAS Tuning done, appended operator to global_operator_cache.")
+                # Use self.operator_cache instead of global_operator_cache
+                self.operator_cache.add(config, bitblas_matmul)
+                # Use self.database_path instead of BITBLAS_DATABASE_PATH
+                self.operator_cache.save_into_database(self.database_path, BITBLAS_TARGET)
+                print("BitBLAS Tuning done, appended operator to operator cache.")
             else:
                 print("BitBLAS Operator created.")
         else:
-            print("BitBLAS Operator found in global_operator_cache.")
+            print("BitBLAS Operator found in operator cache.")
         return bitblas_matmul
 
     def warmup(self, topk=20):
