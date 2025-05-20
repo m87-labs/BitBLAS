@@ -268,11 +268,11 @@ class Linear(nn.Module):
                 self.operator_cache.add(config, bitblas_matmul)
                 # Use self.database_path instead of BITBLAS_DATABASE_PATH
                 self.operator_cache.save_into_database(self.database_path, BITBLAS_TARGET)
-                print("BitBLAS Tuning done, appended operator to operator cache.")
+                logger.info("BitBLAS Tuning done, appended operator to operator cache.")
             else:
-                print("BitBLAS Operator created.")
+                logger.info("BitBLAS Operator created.")
         else:
-            print("BitBLAS Operator found in operator cache.")
+            logger.info("BitBLAS Operator found in operator cache.")
         return bitblas_matmul
 
     def warmup(self, topk=20):
