@@ -1,6 +1,5 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
-
 import ctypes
 import operator
 from functools import reduce
@@ -10,6 +9,9 @@ import torch
 import torch.nn as nn
 
 logger = getLogger(__name__)
+from bitblas import set_log_level
+
+set_log_level("FATAL")
 
 from typing import List, Union, Optional
 
@@ -17,6 +19,7 @@ from bitblas.cache import global_operator_cache, get_database_path
 from bitblas import Matmul, MatmulConfig
 from bitblas.quantization.utils import general_compress
 from bitblas import auto_detect_nvidia_target
+from bitblas.base.operator_common import OptimizeStrategy
 
 BITBLAS_DATABASE_PATH = get_database_path()
 
@@ -32,7 +35,7 @@ def unpack_qzeros(qzeros, bits):
     )
     for col in range(unpacked_zeros.shape[1]):
         i = col % elems_per_int32
-        unpacked_zeros[:, col] = (qzeros[:, col // elems_per_int32] >> (bits * i))
+        unpacked_zeros[:, col] = qzeros[:, col // elems_per_int32] >> (bits * i)
 
     # Follow the instruction in AutoGPTQ qlinear_cuda_old.py line 303
     # NOTE: It appears that casting after the `unpacked_zeros  + 1` is important.
@@ -51,7 +54,7 @@ def unpack_qzeros_v2(qzeros, bits):
     )
     for col in range(unpacked_zeros.shape[1]):
         i = col % elems_per_int32
-        unpacked_zeros[:, col] = (qzeros[:, col // elems_per_int32] >> (bits * i))
+        unpacked_zeros[:, col] = qzeros[:, col // elems_per_int32] >> (bits * i)
 
     # Follow the instruction in AutoGPTQ qlinear_cuda_old.py line 303
     # NOTE: It appears that casting after the `unpacked_zeros  + 1` is important.
@@ -69,7 +72,7 @@ def unpack_qweight(qweight, bits):
     )
     for col in range(unpacked_weight.shape[1]):
         i = col % elems_per_int8
-        unpacked_weight[:, col] = (qweight[:, col // elems_per_int8] >> (bits * i))
+        unpacked_weight[:, col] = qweight[:, col // elems_per_int8] >> (bits * i)
 
     return torch.bitwise_and(unpacked_weight, 2**bits - 1)
 
@@ -84,6 +87,7 @@ class Linear(nn.Module):
         torch.half: "float16",
         torch.int8: "int8",
     }
+    _tuning_message_shown = False
 
     def __init__(
         self,
@@ -105,23 +109,56 @@ class Linear(nn.Module):
         fast_decoding: Optional[bool] = None,
         propagate_b: bool = False,
         # Add these parameters:
-        operator_cache = None,
-        database_path = None,
+        operator_cache=None,
+        database_path=None,
+        create_missing_path: bool = True,  # New parameter to control directory creation
     ):
         """
         @opt_M: optimize range of the input shape for dynamic symbolic
         if the input shape is a range, we will optimize the matmul with dynamic symbolic.
         if the input shape is int, we will optimize the matmul with static symbolic.
-        
+
         @operator_cache: A specific cache instance to use for this linear layer
         @database_path: A specific database path to use for this linear layer
+        @create_missing_path: If True, create the database path if it doesn't exist
         """
+        import os
+
         super().__init__()
 
-        # Store the model-specific cache and database path
-        self.operator_cache = operator_cache if operator_cache is not None else global_operator_cache
-        self.database_path = database_path if database_path is not None else BITBLAS_DATABASE_PATH
+        # Store the model-specific cache
+        self.operator_cache = (
+            operator_cache if operator_cache is not None else global_operator_cache
+        )
 
+        # Handle database path validation - do this ONCE here
+        self.database_path = BITBLAS_DATABASE_PATH  # Default fallback
+        if database_path is not None:
+            if os.path.exists(database_path):
+                self.database_path = database_path
+            elif create_missing_path:
+                # Create the directory if it doesn't exist
+                try:
+                    os.makedirs(database_path, exist_ok=True)
+                    logger.info(f"Created database path: {database_path}")
+                    self.database_path = database_path
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to create database path {database_path}: {e}"
+                    )
+                    logger.warning(
+                        f"Falling back to default database path: {BITBLAS_DATABASE_PATH}"
+                    )
+            else:
+                # User explicitly doesn't want to create missing paths
+                logger.warning(
+                    f"Database path {database_path} does not exist and create_missing_path=False"
+                )
+                logger.warning(
+                    f"Falling back to default database path: {BITBLAS_DATABASE_PATH}"
+                )
+
+        # Rest of your initialization code
         self.in_features = in_features
         self.out_features = out_features
         self.opt_M = opt_M
@@ -164,7 +201,9 @@ class Linear(nn.Module):
 
     def _validate_parameters(self, group_size, in_features, out_features):
         if in_features % 16 != 0 or out_features % 16 != 0:
-            raise ValueError("`in_features` and `out_features` must be divisible by 16.")
+            raise ValueError(
+                "`in_features` and `out_features` must be divisible by 16."
+            )
         if in_features % group_size != 0:
             raise ValueError("`in_features` must be divisible by `group_size`.")
 
@@ -175,7 +214,10 @@ class Linear(nn.Module):
         if self.consistent:
             self.register_buffer(
                 "weight",
-                torch.zeros((out_features, in_features // self.group_size), dtype=self.torch_dtype),
+                torch.zeros(
+                    (out_features, in_features // self.group_size),
+                    dtype=self.torch_dtype,
+                ),
             )
         else:
             self.register_buffer(
@@ -187,10 +229,15 @@ class Linear(nn.Module):
             )
             self.register_buffer(
                 "scales",
-                torch.zeros((out_features, in_features // self.group_size), dtype=self.torch_dtype),
+                torch.zeros(
+                    (out_features, in_features // self.group_size),
+                    dtype=self.torch_dtype,
+                ),
             )
             if self.zeros_mode == "quantized":
-                storage_nbit = int("".join(c for c in self.STORAGE_DTYPE if c.isdigit()))
+                storage_nbit = int(
+                    "".join(c for c in self.STORAGE_DTYPE if c.isdigit())
+                )
                 self.register_buffer(
                     "zeros",
                     torch.zeros(
@@ -210,7 +257,9 @@ class Linear(nn.Module):
                     ),
                 )
         if bias:
-            self.register_buffer("bias", torch.zeros((out_features), dtype=self.torch_dtype))
+            self.register_buffer(
+                "bias", torch.zeros((out_features), dtype=self.torch_dtype)
+            )
         else:
             self.bias = None
 
@@ -244,38 +293,46 @@ class Linear(nn.Module):
             with_bias=bias,
             propagate_b=propagate_b,
             zeros_mode=zeros_mode,
+            optimize_stratety=OptimizeStrategy.SingleBatchDecodeOnly,
         )
-        self.bitblas_matmul = self._get_or_create_bitblas_operator(matmul_config, enable_tuning)
+        self.bitblas_matmul = self._get_or_create_bitblas_operator(
+            matmul_config, enable_tuning
+        )
         self.bits = self.bitblas_matmul.bit
         self.source_format = self.bitblas_matmul.source_format
 
     def _get_or_create_bitblas_operator(self, config, enable_tuning):
         BITBLAS_TARGET = auto_detect_nvidia_target()
 
-        # Use self.operator_cache instead of global_operator_cache
         if self.operator_cache.size() == 0:
             self.operator_cache.load_from_database(self.database_path, BITBLAS_TARGET)
             logger.info(f"Loaded {self.operator_cache.size()} operators from database.")
 
-        # Use self.operator_cache instead of global_operator_cache
         bitblas_matmul = self.operator_cache.get(config)
         if bitblas_matmul is None:
-            # should disable tuning for the first time because we may require loading bitblas operator from database.
             bitblas_matmul = Matmul(config, target=BITBLAS_TARGET, enable_tuning=False)
             if enable_tuning:
+                # Only show the tuning message once
+                if not Linear._tuning_message_shown:
+                    print(
+                        "Compiling matmul kernels...this may take a few minutes. This is a one-time operation."
+                    )
+                    Linear._tuning_message_shown = True
+
                 bitblas_matmul.hardware_aware_finetune(topk=20)
-                # Use self.operator_cache instead of global_operator_cache
                 self.operator_cache.add(config, bitblas_matmul)
-                # Use self.database_path instead of BITBLAS_DATABASE_PATH
-                self.operator_cache.save_into_database(self.database_path, BITBLAS_TARGET)
+                self.operator_cache.save_into_database(
+                    self.database_path, BITBLAS_TARGET
+                )
                 logger.info("BitBLAS Tuning done, appended operator to operator cache.")
-            else:
-                logger.info("BitBLAS Operator created.")
-        else:
-            logger.info("BitBLAS Operator found in operator cache.")
+            # else:
+            #     logger.info("BitBLAS Operator created.")
+        # else:
+        #     logger.info("BitBLAS Operator found in operator cache.")
         return bitblas_matmul
 
     def warmup(self, topk=20):
+        print("Warming up BitBLAS Matmul...")
         self.bitblas_matmul.hardware_aware_finetune(topk=topk)
 
     def forward(self, A, output=None):
@@ -291,7 +348,8 @@ class Linear(nn.Module):
             output = torch.zeros(
                 A.shape[:-1] + (self.out_features,),
                 dtype=getattr(torch, self.bitblas_matmul.out_dtype),
-                device=A.device)
+                device=A.device,
+            )
         args.append(ctypes.c_void_p(output.data_ptr()))
         if self.bitblas_matmul.dynamic_range is not None:
             m = reduce(operator.mul, A.shape[:-1], 1)
@@ -344,10 +402,17 @@ class Linear(nn.Module):
             self.zeros[:, :] = intzeros.to(torch.float16)[:, :] * self.scales[:, :]
         elif self.bitblas_matmul.config.zeros_mode == "quantized":
             self.zeros = (
-                torch.Tensor(general_compress(intzeros.T.contiguous().cpu().numpy(), self.bits)).to(
-                    self.qweight.device).to(self.zeros.dtype).contiguous())
+                torch.Tensor(
+                    general_compress(intzeros.T.contiguous().cpu().numpy(), self.bits)
+                )
+                .to(self.qweight.device)
+                .to(self.zeros.dtype)
+                .contiguous()
+            )
         else:
-            raise ValueError(f"Unsupported zeros type: {self.bitblas_matmul.config.zeros_mode}")
+            raise ValueError(
+                f"Unsupported zeros type: {self.bitblas_matmul.config.zeros_mode}"
+            )
         if self.bias is not None:
             self.bias = gptq_module.bias.data.to(torch.float16).contiguous()
 
@@ -369,10 +434,17 @@ class Linear(nn.Module):
             self.zeros[:, :] = intzeros.to(torch.float16)[:, :] * self.scales[:, :]
         elif self.bitblas_matmul.config.zeros_mode == "quantized":
             self.zeros = (
-                torch.Tensor(general_compress(intzeros.T.contiguous().cpu().numpy(), self.bits)).to(
-                    self.qweight.device).to(self.zeros.dtype).contiguous())
+                torch.Tensor(
+                    general_compress(intzeros.T.contiguous().cpu().numpy(), self.bits)
+                )
+                .to(self.qweight.device)
+                .to(self.zeros.dtype)
+                .contiguous()
+            )
         else:
-            raise ValueError(f"Unsupported zeros type: {self.bitblas_matmul.config.zeros_mode}")
+            raise ValueError(
+                f"Unsupported zeros type: {self.bitblas_matmul.config.zeros_mode}"
+            )
         if self.bias is not None:
             self.bias = gptq_module.bias.data.to(torch.float16).contiguous()
 
